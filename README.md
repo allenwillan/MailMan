@@ -18,7 +18,7 @@ I've been trying to think of a fun C2 setup and decided to implement an email ba
 
 # Resources
 * https://github.com/allenwillan/MailMan - this github
-* - overview video
+* https://youtu.be/fQgzZo_NUU8 - overview video
 * https://help.ubuntu.com/community/PostfixBasicSetupHowto - Walk through I used to get a basic email server up and running.
 * https://smsreceivefree.com - Questionable site that provides various phone numbers to receive SMS on for attempting to circumvent one time codes for sign-up websites. I used it to successfully create Yandex accounts, although Yahoo and AOL seems to have blacklisted the number ranges.
 * https://support.google.com/accounts/answer/6010255?hl=en - "To help keep your account secure, from May 30, 2022, Google no longer supports the use of third-party apps or devices which ask you to sign in to your Google Account using only your username and password."
